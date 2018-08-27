@@ -66,7 +66,7 @@ static const unsigned char thermometer2_bits[] PROGMEM = {
 
 // Gloabl variables
 long lastEncoder, encoder = 0;
-char oled_buffer[50];
+char oled_buffer[30];
 uint8_t varSelector, pageSelector = 0;
 bool ProgramMode = false , ShortClickEnabled = true;
 uint32_t updateTime = millis();
@@ -193,6 +193,31 @@ void readEEprom(){
   Hysteresys = constrain(Hysteresys, 0, 10); 
 }
 
+/*
+  La variabile "stateEncoder" terrà conto contemporaneamente dello stato precedente
+  e di quello attuale degli ingressi collegati all'encoder PINA e PINB secondo il seguente schema:
+ 
+  statoEncoder bit n:
+  7     6       5       4       3       2       1       0
+  NULL  NULL    NULL    NULL    OLDA    OLDB    PINA    PINB
+ 
+  Per come funziona un encoder in quadratura, solo alcune combinazioni sono valide:
+ 
+                            _______         _______      
+                PinA ______|       |_______|       |______ PinA
+  negativo <---         _______         _______         __      --> positivo
+                PinB __|       |_______|       |_______|   PinB
+ 
+        OLDA    OLDB    PINA    PINB    Valore  Array
+        0       0       0       1       +1      (indice 1)
+        0       0       1       0       -1      (indice 2)
+        0       1       0       0       -1      (indice 4)
+        0       1       1       1       +1      (indice 7)
+        1       0       0       0       +1      (indice 8)
+        1       0       1       1       -1      (indice 11)
+        1       1       0       1       -1      (indice 13)
+        1       1       1       0       +1      (indice 14)        
+*/
 void read_encoder(void) {   
   const int validStates[] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, +1, 0};  
   static volatile uint8_t stateEncoder, lastStateEncoder = 0;
