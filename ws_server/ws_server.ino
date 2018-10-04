@@ -253,7 +253,8 @@ void LongClick(){
       ws.textAll(">SETPOINT<" + String(remSetpoint) );
       pageSelector = 0;      
       update_oled();
-      delay(2000);      
+      delay(2000);   
+      ProgramMode = false;
       break;      
   }
 }
