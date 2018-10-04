@@ -1,27 +1,23 @@
 #include <ESP8266WiFi.h>
 #include <EEPROM.h>
 #include <ESPAsyncWebServer.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 
 IPAddress AP_IP(10,10,10,10);
 AsyncWebServer server(80);
 AsyncWebSocket ws("/");
 
-// Dallas DS18B20 library
-#include <DallasTemperature.h>
+// Dallas DS18B20
 #define ONE_WIRE_BUS D2
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress ds18b20;
 
-// Button event handler
-#include <SeqButton.h>
-SeqButton  ShortClick, LongClick;
-
-// OLED display library   
+// OLED display
 #define SDA D3
 #define SCL D4
-#include <Wire.h>
-#include <U8g2lib.h>
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C oled(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ SCL, /* data=*/ SDA);
 #define thermo_width 32
 #define thermo_height 32
@@ -60,9 +56,13 @@ static const unsigned char thermometer2_bits[] PROGMEM = {
 #define RelayPin D1
 
 // Input
-#define SWITCH D5
-#define ENC_A D7    
-#define ENC_B D6  
+#define SW D5
+#define DT D7    
+#define CLK D6  
+
+#define LONGCLICK   1000
+#define SHORTCLICK  50
+uint32_t pressTime = millis();
 
 // Gloabl variables
 long lastEncoder, encoder = 0;
@@ -80,14 +80,11 @@ boolean relayMode = 0;  //  0:  T1 - external; >0 T1 - Internal
 
 void setup(void) {  
   pinMode(RelayPin, OUTPUT);                // Output mode to drive relay
-  pinMode(SWITCH, INPUT_PULLUP);  
-  pinMode(ENC_A, INPUT_PULLUP); 
-  pinMode(ENC_B, INPUT_PULLUP);  
+  pinMode(SW, INPUT_PULLUP);  
+  pinMode(DT, INPUT_PULLUP); 
+  pinMode(CLK, INPUT_PULLUP); 
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);  
-  
-  ShortClick.init(SWITCH, NULL, &f_ShortClick, false, LOW, 60);
-  LongClick.init(SWITCH, &f_LongClick, NULL, false, LOW, 2000);  
-  
+    
   DBG_SERIAL.begin(115200);
   DBG_SERIAL.println(); 
   DBG_SERIAL.println("Configuring access point...");
@@ -112,17 +109,17 @@ void setup(void) {
     DBG_SERIAL.println("Unable to find address for Device 0");
   sensors.setResolution(ds18b20, 10);
 
-  oled.begin();  
-  attachInterrupt(digitalPinToInterrupt(ENC_A), read_encoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B), read_encoder, CHANGE);
+  oled.begin();    
+  attachInterrupt(digitalPinToInterrupt(CLK), read_encoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(DT), read_encoder, CHANGE);
   EEPROM.begin(32);
   readEEprom();    
 }
 
 
 void loop(void) {    
-  ShortClick.handler();
-  LongClick.handler();
+  pressTime = millis();
+  checkButton();
   
   update_oled();
   update_serial_msg();
@@ -157,12 +154,14 @@ void loop(void) {
         case 0:
           break;
         case 1:   
-          Setpoint = Setpoint + (float)encoder;    
+          // L'encoder rotativo che uso al momento genera 4 interrupt ad ogni "click" percepibile al tatto
+          // Siccome è necessaria una regolazione più "fine" divido il numero dei conteggi "encoder" per 4
+          Setpoint = Setpoint + (float)encoder/4;    
           Setpoint = constrain(Setpoint, -10, 99);      
           DBG_SERIAL.printf("\nSetpoint: %d°C", (int)Setpoint);   
           break; 
         case 2: 
-          Hysteresys = Hysteresys + (float)encoder;               
+          Hysteresys = Hysteresys + (float)encoder/4;               
           Hysteresys = constrain(Hysteresys, 0, 10);             
           DBG_SERIAL.printf("\nHysteresys %d°C",(int)Hysteresys);  
           break; 
@@ -171,7 +170,7 @@ void loop(void) {
           DBG_SERIAL.println(relayMode ? "T1: locale" : "T1: remoto" );    // C++ ternary operator (x == y) ? a : b   
           break;
         case 4: 
-          remSetpoint = remSetpoint + (float)encoder;               
+          remSetpoint = remSetpoint + (float)encoder/4;               
           remSetpoint = constrain(remSetpoint, -10, 99);             
           DBG_SERIAL.printf("\nSetpoint remoto %d°C",(int)remSetpoint);  
           break; 
@@ -185,6 +184,81 @@ void loop(void) {
 }
 
 // **************************  **********************************************
+
+// Controlliamo se il pulsante è stato premuto brevemente o più a lungo
+void checkButton(void){
+  if(digitalRead(SW) == LOW){
+    delay(SHORTCLICK);    
+    bool xLong = false;
+    while(digitalRead(SW) == LOW){
+      if(millis() - pressTime > LONGCLICK) {  
+        xLong = true;    
+        break;
+      }          
+    }
+    xLong ? LongClick() : SingleClick();      
+  }  
+}
+
+
+///// ****************** Short Switch callback function ****************** /////
+void SingleClick(){ 
+  DBG_SERIAL.println("\nSingle Click");
+  if(pageSelector == 1){
+      // In fase di programmazione selezioniamo quale variabile sarà modificata
+      varSelector = (varSelector+1) % 5;      
+    }        
+  
+  // Se non sono in fase di programmazione, mostro gli attuali parametri di funzionamento.
+  if(!ProgramMode) {   
+    oled.firstPage();
+    do {
+      oled.setFont(u8g2_font_courB10_tf );
+      sprintf(oled_buffer, "Setpoint %2d%cC", (int)Setpoint, 0xB0);
+      oled.drawStr(0, 25, oled_buffer);  
+      sprintf(oled_buffer, "Isteresi %c%2d%cC", 0xB1, (int)Hysteresys, 0xB0);
+      oled.drawStr(0, 50, oled_buffer);        
+    } while ( oled.nextPage() ); 
+    delay(1000);    
+  }
+ 
+}
+
+///// ****************** Long Switch callback function ****************** /////
+void LongClick(){    
+  DBG_SERIAL.println("\nLong Click");
+  switch(pageSelector){
+    case 0:
+      ProgramMode = true;            
+      DBG_SERIAL.println("\nProgram mode ON");
+      pageSelector = 1;    
+      varSelector = 0;  
+      update_oled();
+      delay(500);
+      break;
+    case 1:
+      pageSelector = (pageSelector+1) % 3;
+      update_oled();      
+      break;    
+    case 2:         
+      uint16_t adr = 0;
+      EEPROM.put(adr, Setpoint);      
+      adr += sizeof(float);
+      EEPROM.put(adr, Hysteresys);
+      adr += sizeof(float);
+      EEPROM.put(adr, remSetpoint); 
+      adr += sizeof(uint8_t);
+      EEPROM.put(adr, relayMode);
+      EEPROM.commit();
+      ws.textAll(">SETPOINT<" + String(remSetpoint) );
+      pageSelector = 0;      
+      update_oled();
+      delay(2000);      
+      break;      
+  }
+}
+
+
 
 // Filtriamo un po' i valori ricevuti dal websocket
 float output = 0;
@@ -202,14 +276,15 @@ void readEEprom(){
   adr += sizeof(uint8_t);
   EEPROM.get(adr, relayMode);
 
-
   // First boot on fresh ESP8266
   if( Setpoint > 100 ) Setpoint = 25.0F;
   if( Hysteresys > 100 ) Hysteresys = 2.0F;
   if( remSetpoint > 100 ) remSetpoint = 25.0F;
 }
 
-/*
+
+void read_encoder(void) {      
+  /*
   La variabile "stateEncoder" terrà conto contemporaneamente dello stato precedente
   e di quello attuale degli ingressi collegati all'encoder PINA e PINB secondo il seguente schema:
  
@@ -217,13 +292,12 @@ void readEEprom(){
   7     6       5       4       3       2       1       0
   NULL  NULL    NULL    NULL    OLDA    OLDB    PINA    PINB
  
-  Per come funziona un encoder in quadratura, solo alcune combinazioni sono valide:
- 
+  Per come funziona un encoder in quadratura, solo alcune combinazioni sono valide: 
                             _______         _______      
                 PinA ______|       |_______|       |______ PinA
   negativo <---         _______         _______         __      --> positivo
                 PinB __|       |_______|       |_______|   PinB
- 
+
         OLDA    OLDB    PINA    PINB    Valore  Array
         0       0       0       1       +1      (indice 1)
         0       0       1       0       -1      (indice 2)
@@ -233,88 +307,14 @@ void readEEprom(){
         1       0       1       1       -1      (indice 11)
         1       1       0       1       -1      (indice 13)
         1       1       1       0       +1      (indice 14)        
-*/
-void read_encoder(void) {   
-  const int validStates[] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, +1, 0};  
-  static volatile uint8_t stateEncoder, lastStateEncoder = 0;
-  static volatile uint8_t arrayIndex = 0;  
-  static bool tictoc = true;
-  stateEncoder <<= 2;                                               // Eseguo uno shift di due posizioni a sinistra per non sovrascrivere la lettura precedente    
-  stateEncoder |=  digitalRead(ENC_A) << 1 | digitalRead(ENC_B) ;   // Imposto i bit relativi allo stato attuale del canale A e del canale B      
-  arrayIndex = 0b00001111 & stateEncoder;                           // Applico la maschera per tenere conto solo dei 4 bit di encoderState realmente usati 
-   
-  if(stateEncoder != lastStateEncoder && tictoc){    
-    lastStateEncoder = stateEncoder;
-    encoder += validStates[arrayIndex]; 
-  }
-  tictoc = !tictoc;
+  */
+  const int validStates[] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, +1, 0};
+  static volatile uint8_t stateEncoder = 0b00000000;              // NU; NU; NU; NU; OLDA; OLDB; CH_A; CH_B;    
+  stateEncoder <<= 2;                                             // Eseguo uno shift di due posizioni a sinistra per tenere traccia dello stato prima della transizione
+  stateEncoder |=  digitalRead(DT) << 1 | digitalRead(CLK) ;      // Imposto i bit relativi allo stato attuale del canale A e del canale B      
+  uint8_t arrayIndex = 0b00001111 & stateEncoder;                 // Applico la maschera per valutare solo i primi 4 bit shiftati precedentemente  
+  encoder += validStates[arrayIndex];   
 }
-
-
-
-///// ****************** Short Switch callback function ****************** /////
-void f_ShortClick(SeqButton * button){  
-  if(ShortClickEnabled){
-    DBG_SERIAL.println("\nShort Click"); 
-    if(pageSelector == 1){
-      // In fase di programmazione selezioniamo quale variabile sarà modificata
-      varSelector = (varSelector+1) % 5;      
-    }        
-  }
-  else
-    ShortClickEnabled = true;  
-  // Se non sono in fase di programmazione, mostro gli attuali parametri di funzionamento.
-  if(!ProgramMode) {   
-    oled.firstPage();
-    do {
-      oled.setFont(u8g2_font_courB10_tf );
-      sprintf(oled_buffer, "Setpoint %2d%cC", (int)Setpoint, 0xB0);
-      oled.drawStr(0, 25, oled_buffer);  
-      sprintf(oled_buffer, "Isteresi %c%2d%cC", 0xB1, (int)Hysteresys, 0xB0);
-      oled.drawStr(0, 50, oled_buffer);        
-    } while ( oled.nextPage() ); 
-    delay(1000);    
-  }
- 
-}
-
-///// ****************** Long Switch callback function ****************** /////
-void f_LongClick(SeqButton * button){  
-  DBG_SERIAL.println("\nLong Click"); 
-  switch(pageSelector){
-    case 0:
-      ProgramMode = true;      
-      ShortClickEnabled = false;    
-      DBG_SERIAL.println("\nProgram mode ON");
-      pageSelector = 1;    
-      varSelector = 0;  
-      update_oled();
-      delay(500);
-      break;
-    case 1:
-      pageSelector = (pageSelector+1) % 3;
-      update_oled();
-      ShortClickEnabled = false;
-      break;    
-    case 2:         
-      uint16_t adr = 0;
-      EEPROM.put(adr, Setpoint);      
-      adr += sizeof(float);
-      EEPROM.put(adr, Hysteresys);
-      adr += sizeof(float);
-      EEPROM.put(adr, remSetpoint); 
-      adr += sizeof(uint8_t);
-      EEPROM.put(adr, relayMode);
-      EEPROM.commit();
-      ws.textAll(">SETPOINT<" + String(remSetpoint) );
-      pageSelector = 0;      
-      update_oled();
-      delay(2000);
-      ShortClickEnabled = true;    
-      break;      
-  }
-}
-
 
 void update_serial_msg(){
   static uint32_t updateSerial;   
@@ -445,4 +445,3 @@ void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventT
       break;    
    } // end of switch
 }
-
