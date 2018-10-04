@@ -1,14 +1,14 @@
 #include <ESP8266WiFi.h>
 #include <EEPROM.h>
+#include <ESPAsyncWebServer.h>
 
-#include <WebSocketsServer.h>
-IPAddress AP_IP(42,42,42,42);
-const uint8_t ws_port = 81;
-WebSocketsServer webSocket = WebSocketsServer(ws_port);
+IPAddress AP_IP(10,10,10,10);
+AsyncWebServer server(80);
+AsyncWebSocket ws("/");
 
 // Dallas DS18B20 library
 #include <DallasTemperature.h>
-#define ONE_WIRE_BUS D5
+#define ONE_WIRE_BUS D2
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress ds18b20;
@@ -18,8 +18,8 @@ DeviceAddress ds18b20;
 SeqButton  ShortClick, LongClick;
 
 // OLED display library   
-#define SDA D6
-#define SCL D7
+#define SDA D3
+#define SCL D4
 #include <Wire.h>
 #include <U8g2lib.h>
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C oled(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ SCL, /* data=*/ SDA);
@@ -60,9 +60,9 @@ static const unsigned char thermometer2_bits[] PROGMEM = {
 #define RelayPin D1
 
 // Input
-#define SWITCH D2
-#define ENC_A D3    
-#define ENC_B D4  
+#define SWITCH D5
+#define ENC_A D7    
+#define ENC_B D6  
 
 // Gloabl variables
 long lastEncoder, encoder = 0;
@@ -74,15 +74,17 @@ uint32_t updateOledTime = millis();
 
 float T1 = 30.0F, T2 = 45.0F;
 float Setpoint = 50.0F;
+float remSetpoint = 45.0F;
 float Hysteresys = 2.0F;
 boolean relayMode = 0;  //  0:  T1 - external; >0 T1 - Internal
 
-void setup(void) {
-  digitalWrite(RelayPin, HIGH);             // Make sure relay is off when start 
+void setup(void) {  
   pinMode(RelayPin, OUTPUT);                // Output mode to drive relay
   pinMode(SWITCH, INPUT_PULLUP);  
   pinMode(ENC_A, INPUT_PULLUP); 
   pinMode(ENC_B, INPUT_PULLUP);  
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);  
+  
   ShortClick.init(SWITCH, NULL, &f_ShortClick, false, LOW, 60);
   LongClick.init(SWITCH, &f_LongClick, NULL, false, LOW, 2000);  
   
@@ -93,14 +95,19 @@ void setup(void) {
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255,255,255,0));
   WiFi.softAP("ESP_12345", "12345678");   // password MUST ust be 8-32 character
   IPAddress myIP = WiFi.softAPIP();
-  // Start websocket server
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
-  DBG_SERIAL.printf("\nWebSocket server ready!\nAddress: ws://%d.%d.%d.%d:%d", myIP[0], myIP[1], myIP[2], myIP[3], ws_port );  
+  // Start server and websocket server
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", String(ESP.getFreeHeap()));
+  });
+  server.begin(); 
+     
+  DBG_SERIAL.printf("\nWebSocket server ready!\nAddress: ws://%d.%d.%d.%d/", myIP[0], myIP[1], myIP[2], myIP[3] );  
  
   sensors.begin();
   DBG_SERIAL.printf("\nFound %d devices", sensors.getDeviceCount());    
-  DBG_SERIAL.printf("\nParasite power is: %d.", sensors.isParasitePowerMode());
+  DBG_SERIAL.printf("\nParasite power is: %s.", sensors.isParasitePowerMode() ? "ON" : "OFF");
   if (!sensors.getAddress(ds18b20, 0)) 
     DBG_SERIAL.println("Unable to find address for Device 0");
   sensors.setResolution(ds18b20, 10);
@@ -114,8 +121,6 @@ void setup(void) {
 
 
 void loop(void) {    
-  webSocket.loop();
-  
   ShortClick.handler();
   LongClick.handler();
   
@@ -134,12 +139,12 @@ void loop(void) {
       T2 = sensors.getTempC(ds18b20);
       T2 = constrain(T2, -55, 99);
     }
-    webSocket.broadcastTXT("?TEMP?");
+    ws.textAll("?TEMP?");
     
-    if((T2 + Hysteresys >=  T1)&&(T2 > Setpoint))
-      digitalWrite(RelayPin, LOW);
-    if((T2 + Hysteresys <=  T1)&&(T2 > Setpoint))
+    if((T2 >=  T1 + Hysteresys)&&(T2 > Setpoint))
       digitalWrite(RelayPin, HIGH);
+    if((T2 <=  T1 - Hysteresys)&&(T2 > Setpoint))
+      digitalWrite(RelayPin, LOW);
   }  
   
   // L'encoder rotativo è stato ruotato in fase di programmazione?
@@ -163,8 +168,13 @@ void loop(void) {
           break; 
         case 3: 
           relayMode = !relayMode; 
-          DBG_SERIAL.println(relayMode ? "T1: remoto" : "T1: locale");    // C++ ternary operator (x == y) ? a : b   
+          DBG_SERIAL.println(relayMode ? "T1: locale" : "T1: remoto" );    // C++ ternary operator (x == y) ? a : b   
           break;
+        case 4: 
+          remSetpoint = remSetpoint + (float)encoder;               
+          remSetpoint = constrain(remSetpoint, -10, 99);             
+          DBG_SERIAL.printf("\nSetpoint remoto %d°C",(int)remSetpoint);  
+          break; 
       }        
       // Force oled update
       updateOledTime = millis();
@@ -187,10 +197,16 @@ void readEEprom(){
   EEPROM.get(adr, Setpoint);  
   adr += sizeof(float);
   EEPROM.get(adr, Hysteresys);  
+  adr += sizeof(float);
+  EEPROM.get(adr, remSetpoint); 
   adr += sizeof(uint8_t);
   EEPROM.get(adr, relayMode);
-  Setpoint = constrain(Setpoint, -10, 100);  
-  Hysteresys = constrain(Hysteresys, 0, 10); 
+
+
+  // First boot on fresh ESP8266
+  if( Setpoint > 100 ) Setpoint = 25.0F;
+  if( Hysteresys > 100 ) Hysteresys = 2.0F;
+  if( remSetpoint > 100 ) remSetpoint = 25.0F;
 }
 
 /*
@@ -242,7 +258,7 @@ void f_ShortClick(SeqButton * button){
     DBG_SERIAL.println("\nShort Click"); 
     if(pageSelector == 1){
       // In fase di programmazione selezioniamo quale variabile sarà modificata
-      varSelector = (varSelector+1) % 4;      
+      varSelector = (varSelector+1) % 5;      
     }        
   }
   else
@@ -285,9 +301,12 @@ void f_LongClick(SeqButton * button){
       EEPROM.put(adr, Setpoint);      
       adr += sizeof(float);
       EEPROM.put(adr, Hysteresys);
+      adr += sizeof(float);
+      EEPROM.put(adr, remSetpoint); 
       adr += sizeof(uint8_t);
       EEPROM.put(adr, relayMode);
       EEPROM.commit();
+      ws.textAll(">SETPOINT<" + String(remSetpoint) );
       pageSelector = 0;      
       update_oled();
       delay(2000);
@@ -319,7 +338,7 @@ void update_serial_msg(){
 
 // **************************      OLED DISPLAY  Handler     *************************
 void update_oled(){  
-  if(millis() - updateOledTime > 100){  
+  if(millis() - updateOledTime > 200){  
     updateOledTime = millis();  
     oled.firstPage();
     do {       
@@ -329,7 +348,7 @@ void update_oled(){
         case 0:                         
           oled.drawXBMP( 0, 0, thermo_width, thermo_height, thermometer1_bits);
           // Se il relé è attivo, cambiamo icona e facciamola blinkare 
-          if(digitalRead(RelayPin) == LOW){
+          if(digitalRead(RelayPin)){
             oled.setFont(u8g2_font_open_iconic_all_4x_t);   
             static uint32_t blinkIconTime = millis();
             static bool blinkIcon = false;            
@@ -360,19 +379,20 @@ void update_oled(){
           sprintf(oled_buffer, "Setpoint %2d%cC", (int)Setpoint, 0xB0);     // 0xB0 == '°'  0xB1 == '+-'
           oled.drawStr(2, 13, oled_buffer);  
           sprintf(oled_buffer, "Isteresi %c%2d%cC", 0xB1, (int)Hysteresys, 0xB0);   
-          oled.drawStr(2, 37, oled_buffer);   
-          oled.drawStr(2, 60, relayMode ? "T1: remota" : "T1: locale");            
-          
+          oled.drawStr(2, 30, oled_buffer);   
+          oled.drawStr(2, 45, relayMode ? "T1: remota" : "T1: locale");     
+          sprintf(oled_buffer, "SP remoto %2d%cC" , (int)remSetpoint, 0xB0);       
+          oled.drawStr(2, 60, oled_buffer);
           // Nella fase di programmazione dei parametri, 
           // evidenziamo quello che si sta modificando con una cornice
-          if(varSelector == 1)            
-            oled.drawFrame(0, 1, 128, 17);
-          else if (varSelector == 2) 
-            oled.drawFrame(0, 24, 128, 17);
-          else if (varSelector == 3) 
-            oled.drawFrame(0, 47, 128, 17);                     
-          break; 
-             
+          switch(varSelector){
+            case 1: oled.drawFrame(0, 1, 128, 17); break;
+            case 2: oled.drawFrame(0, 17, 128, 17); break;
+            case 3: oled.drawFrame(0, 32, 128, 17); break;
+            case 4: oled.drawFrame(0, 47, 128, 17); break;
+          }
+          break;
+
         // Pagina di conferma salvataggio parametri
         case 2:  
           oled.setFont(u8g2_font_courB10_tf);  
@@ -384,43 +404,45 @@ void update_oled(){
   } 
 }
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  switch(type) {
-    case WStype_DISCONNECTED:
-      DBG_SERIAL.printf("[%u] Disconnected!\n", num);
+
+
+void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+   switch (type){
+    case WS_EVT_CONNECT: 
+      DBG_SERIAL.printf("ws[%s][%u] connect\n", server->url(), client->id());
+      client->printf("Client id %u connected. (%u clients connected)", client->id(), server->count());            
+      client->ping();            
       break;
-    case WStype_CONNECTED:      
-      DBG_SERIAL.printf("[%u] New client connected.\n", num);
-      webSocket.sendTXT(num, "Welcome!");            
+    case WS_EVT_DISCONNECT:
+      DBG_SERIAL.printf("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
       break;
-    case WStype_TEXT:
-      DBG_SERIAL.printf("[%u] get Text: %s\n", num, payload);      
-      webSocket.sendTXT(num, "Message received.");
-      if (payload[0] == '>') {
-        String tempStr;
-        uint8_t i = 1;
-        while(payload[i] != '<'){
-          tempStr += (char)payload[i];
-          i++;
+    case WS_EVT_ERROR:
+      DBG_SERIAL.printf("ws[%s][%u] error(%u): %s\n", server->url(), client->id(), *((uint16_t*)arg), (char*)data);
+      break;
+    case WS_EVT_PONG:
+      DBG_SERIAL.printf("ws[%s][%u] pong[%u]: %s\n", server->url(), client->id(), len, (len)?(char*)data:"");            
+      break;
+    case WS_EVT_DATA:
+      AwsFrameInfo * info = (AwsFrameInfo*)arg;
+      String msg = "";
+      if(info->final && info->index == 0 && info->len == len){
+        DBG_SERIAL.printf("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT)?"text":"binary", info->len);                              
+        if(info->opcode == WS_TEXT){
+          for(size_t i=0; i < info->len; i++) 
+            msg += (char) data[i];
+
+          // Check if we have a Temperature message
+          if (msg[0] == '>') {
+            String tempStr = msg.substring(1, info->len - 1);            
+            if(relayMode == 0)
+              T2 = smooth(tempStr.toFloat());                          
+            else 
+              T1 = smooth(tempStr.toFloat());               
+            DBG_SERIAL.printf("External water temperature: %s°C\n", tempStr.c_str());         
+          } 
         }
-        if(relayMode == 0){
-          T2 = smooth(tempStr.toFloat());
-          DBG_SERIAL.println(T2);
-        }
-        else {
-           T1 = smooth(tempStr.toFloat());
-           DBG_SERIAL.println(T1);
-        }
-        
-        DBG_SERIAL.printf("External water temperature: %s°C\n", tempStr.c_str());  
       }
-      break;
-    case WStype_BIN:
-      DBG_SERIAL.printf("[%u] get binary length: %u\n", num, length);
-      hexdump(payload, length);
-      break;
-  }
+      break;    
+   } // end of switch
 }
-
-
 
